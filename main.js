@@ -1,14 +1,22 @@
 const dgram = require("dgram");
 const HID = require("node-hid");
+const { execFile } = require("child_process");
+const fs = require("fs");
+const path = require("path");
 
 // ===== CONFIG =====
 const UDP_PORT = 20777;
+const BEEP_ENABLED = process.argv.includes("--beep");
 
 const VENDOR_ID = 0x046d;
 const PRODUCT_ID = 0xc24f;
 
 const FLASH_THRESHOLD = 0.9; // fraction of RPM range to start flashing (matches last LED)
-const FLASH_INTERVAL = 50; // ms between on/off toggles (~10Hz)const TELEMETRY_TIMEOUT = 2000; // ms without telemetry before turning off LEDs
+const FLASH_INTERVAL = 50; // ms between on/off toggles (~10Hz)
+const TELEMETRY_TIMEOUT = 2000; // ms without telemetry before turning off LEDs
+
+const BEEP_FREQ = 3000; // Hz
+const BEEP_DURATION = 0.4; // seconds
 // ===== STATE =====
 let device;
 let previousMask = -1;
@@ -17,6 +25,49 @@ let maxRpm = 0;
 let flashTimer = null;
 let flashOn = false;
 let telemetryWatchdog = null;
+let hasBeepedThisShift = false;
+let previousGear = 0;
+
+// ===== BEEP TONE =====
+const BEEP_WAV_PATH = path.join("/tmp", "f1_g29_beep.wav");
+
+function generateBeepWav(freq, duration, sampleRate = 44100) {
+  const numSamples = Math.floor(sampleRate * duration);
+  const dataSize = numSamples * 2;
+  const buf = Buffer.alloc(44 + dataSize);
+
+  buf.write("RIFF", 0);
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write("WAVE", 8);
+  buf.write("fmt ", 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); // PCM
+  buf.writeUInt16LE(1, 22); // mono
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  buf.writeUInt16LE(2, 32); // block align
+  buf.writeUInt16LE(16, 34); // bits per sample
+  buf.write("data", 36);
+  buf.writeUInt32LE(dataSize, 40);
+
+  for (let i = 0; i < numSamples; i++) {
+    const sample =
+      Math.sin((2 * Math.PI * freq * i) / sampleRate) * 0.1 * 32767;
+    buf.writeInt16LE(Math.round(sample), 44 + i * 2);
+  }
+  return buf;
+}
+
+if (BEEP_ENABLED) {
+  fs.writeFileSync(BEEP_WAV_PATH, generateBeepWav(BEEP_FREQ, BEEP_DURATION));
+}
+
+function playBeep() {
+  if (!BEEP_ENABLED) return;
+  execFile("paplay", [BEEP_WAV_PATH], (err, stdout, stderr) => {
+    if (err) console.log("🔊 Beep error:", err.message, stderr);
+  });
+}
 
 // ===== CONNECT WHEEL =====
 function connectWheel() {
@@ -97,9 +148,15 @@ function updateLEDs(rpm) {
   // flash all LEDs at shift point
   if (frac >= FLASH_THRESHOLD) {
     startFlashing();
+    if (!hasBeepedThisShift) {
+      playBeep();
+      hasBeepedThisShift = true;
+    }
     return;
   }
 
+  // only reset beep flag when RPM drops well below threshold
+  // (prevents re-beep on downshift RPM spikes that briefly cross the threshold)
   stopFlashing();
 
   let mask = 0x00;
@@ -154,6 +211,12 @@ function handlePacket(msg) {
 
     const rpm = msg.readUInt16LE(base + 16);
     if (rpm <= 0 || rpm > 20000) return;
+
+    const gear = msg.readInt8(base + 15);
+    if (gear > previousGear) {
+      hasBeepedThisShift = false; // upshift — allow beep for new gear
+    }
+    previousGear = gear;
 
     updateLEDs(rpm);
     resetWatchdog();
