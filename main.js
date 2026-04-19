@@ -7,9 +7,8 @@ const UDP_PORT = 20777;
 const VENDOR_ID = 0x046d;
 const PRODUCT_ID = 0xc24f;
 
-const FLASH_THRESHOLD = 0.97; // fraction of RPM range to start flashing
-const FLASH_INTERVAL = 50; // ms between on/off toggles (~10Hz)
-
+const FLASH_THRESHOLD = 0.9; // fraction of RPM range to start flashing (matches last LED)
+const FLASH_INTERVAL = 50; // ms between on/off toggles (~10Hz)const TELEMETRY_TIMEOUT = 2000; // ms without telemetry before turning off LEDs
 // ===== STATE =====
 let device;
 let previousMask = -1;
@@ -17,6 +16,7 @@ let idleRpm = 0;
 let maxRpm = 0;
 let flashTimer = null;
 let flashOn = false;
+let telemetryWatchdog = null;
 
 // ===== CONNECT WHEEL =====
 function connectWheel() {
@@ -51,6 +51,22 @@ function resetLEDsOnStartup() {
 
     console.log("🔄 Startup LED reset complete");
   }, 300);
+}
+
+// ===== CLEANUP =====
+function shutdownLEDs() {
+  stopFlashing();
+  writeLED(0x00);
+  previousMask = -1;
+}
+
+// ===== TELEMETRY WATCHDOG =====
+function resetWatchdog() {
+  if (telemetryWatchdog) clearTimeout(telemetryWatchdog);
+  telemetryWatchdog = setTimeout(() => {
+    shutdownLEDs();
+    console.log("💤 No telemetry — LEDs off");
+  }, TELEMETRY_TIMEOUT);
 }
 
 // ===== LED FLASH =====
@@ -140,6 +156,7 @@ function handlePacket(msg) {
     if (rpm <= 0 || rpm > 20000) return;
 
     updateLEDs(rpm);
+    resetWatchdog();
   } catch (err) {
     console.log("Packet error:", err.message);
   }
@@ -160,3 +177,14 @@ socket.on("listening", () => {
 });
 
 socket.bind(20777);
+
+// ===== CLEAN EXIT =====
+process.on("SIGINT", () => {
+  shutdownLEDs();
+  console.log("\n🛑 LEDs off — exiting");
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  shutdownLEDs();
+  process.exit(0);
+});
