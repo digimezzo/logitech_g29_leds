@@ -7,11 +7,16 @@ const UDP_PORT = 20777;
 const VENDOR_ID = 0x046d;
 const PRODUCT_ID = 0xc24f;
 
+const FLASH_THRESHOLD = 0.97; // fraction of RPM range to start flashing
+const FLASH_INTERVAL = 50; // ms between on/off toggles (~10Hz)
+
 // ===== STATE =====
 let device;
 let previousMask = -1;
 let idleRpm = 0;
 let maxRpm = 0;
+let flashTimer = null;
+let flashOn = false;
 
 // ===== CONNECT WHEEL =====
 function connectWheel() {
@@ -48,6 +53,23 @@ function resetLEDsOnStartup() {
   }, 300);
 }
 
+// ===== LED FLASH =====
+function startFlashing() {
+  if (flashTimer) return;
+  flashOn = true;
+  flashTimer = setInterval(() => {
+    flashOn = !flashOn;
+    writeLED(flashOn ? 0x1f : 0x00);
+  }, FLASH_INTERVAL);
+}
+
+function stopFlashing() {
+  if (!flashTimer) return;
+  clearInterval(flashTimer);
+  flashTimer = null;
+  flashOn = false;
+}
+
 // ===== DIRECT LED LOGIC (NO SMOOTHING) =====
 function updateLEDs(rpm) {
   if (maxRpm === 0) return; // no status packet received yet
@@ -55,6 +77,14 @@ function updateLEDs(rpm) {
   // map rpm to 0.0-1.0 within the usable range (idle to max)
   const range = maxRpm - idleRpm;
   const frac = Math.max(0, (rpm - idleRpm) / range);
+
+  // flash all LEDs at shift point
+  if (frac >= FLASH_THRESHOLD) {
+    startFlashing();
+    return;
+  }
+
+  stopFlashing();
 
   let mask = 0x00;
 
