@@ -11,7 +11,6 @@ const BEEP_ENABLED = process.argv.includes("--beep");
 const VENDOR_ID = 0x046d;
 const PRODUCT_ID = 0xc24f;
 
-const FLASH_THRESHOLD = 0.9; // fraction of RPM range to start flashing (matches last LED)
 const FLASH_INTERVAL = 50; // ms between on/off toggles (~10Hz)
 const TELEMETRY_TIMEOUT = 2000; // ms without telemetry before turning off LEDs
 
@@ -20,13 +19,12 @@ const BEEP_DURATION = 0.4; // seconds
 // ===== STATE =====
 let device;
 let previousMask = -1;
-let idleRpm = 0;
-let maxRpm = 0;
 let flashTimer = null;
 let flashOn = false;
 let telemetryWatchdog = null;
 let hasBeepedThisShift = false;
-let previousGear = 0;
+let previousGear = -1;
+let beepArmed = false; // only arm after an upshift
 
 // ===== BEEP TONE =====
 const BEEP_WAV_PATH = path.join("/tmp", "f1_g29_beep.wav");
@@ -109,6 +107,9 @@ function shutdownLEDs() {
   stopFlashing();
   writeLED(0x00);
   previousMask = -1;
+  previousGear = -1;
+  hasBeepedThisShift = false;
+  beepArmed = false;
 }
 
 // ===== TELEMETRY WATCHDOG =====
@@ -124,6 +125,7 @@ function resetWatchdog() {
 function startFlashing() {
   if (flashTimer) return;
   flashOn = true;
+  writeLED(0x1f); // immediately all-on, no gap
   flashTimer = setInterval(() => {
     flashOn = !flashOn;
     writeLED(flashOn ? 0x1f : 0x00);
@@ -135,37 +137,32 @@ function stopFlashing() {
   clearInterval(flashTimer);
   flashTimer = null;
   flashOn = false;
+  previousMask = -1; // force next writeLED since flash may have left LEDs in unknown state
 }
 
 // ===== DIRECT LED LOGIC (NO SMOOTHING) =====
-function updateLEDs(rpm) {
-  if (maxRpm === 0) return; // no status packet received yet
-
-  // map rpm to 0.0-1.0 within the usable range (idle to max)
-  const range = maxRpm - idleRpm;
-  const frac = Math.max(0, (rpm - idleRpm) / range);
-
-  // flash all LEDs at shift point
-  if (frac >= FLASH_THRESHOLD) {
+function updateLEDs(rpm, revLightsPercent) {
+  // flash all LEDs at shift point (use game's per-gear rev lights)
+  // hysteresis: start flashing at 95%, only stop below 85%
+  if (revLightsPercent >= 95 || (flashTimer && revLightsPercent >= 85)) {
     startFlashing();
-    if (!hasBeepedThisShift) {
+    if (!hasBeepedThisShift && beepArmed) {
       playBeep();
       hasBeepedThisShift = true;
     }
     return;
   }
 
-  // only reset beep flag when RPM drops well below threshold
-  // (prevents re-beep on downshift RPM spikes that briefly cross the threshold)
   stopFlashing();
 
+  // progressive LEDs based on game's per-gear rev lights percentage
   let mask = 0x00;
 
-  if (frac > 0.05) mask |= 0x01;
-  if (frac > 0.25) mask |= 0x02;
-  if (frac > 0.5) mask |= 0x04;
-  if (frac > 0.75) mask |= 0x08;
-  if (frac > 0.9) mask |= 0x10;
+  if (revLightsPercent > 5) mask |= 0x01;
+  if (revLightsPercent > 25) mask |= 0x02;
+  if (revLightsPercent > 50) mask |= 0x04;
+  if (revLightsPercent > 75) mask |= 0x08;
+  if (revLightsPercent > 90) mask |= 0x10;
 
   // only send if changed (prevents USB spam)
   if (mask !== previousMask) {
@@ -173,7 +170,7 @@ function updateLEDs(rpm) {
     writeLED(mask);
 
     console.log(
-      `RPM: ${rpm} | idle: ${idleRpm} | max: ${maxRpm} | ${(frac * 100).toFixed(1)}% | mask: ${mask.toString(2).padStart(5, "0")}`,
+      `RPM: ${rpm} | rev: ${revLightsPercent}% | mask: ${mask.toString(2).padStart(5, "0")}`,
     );
   }
 }
@@ -187,22 +184,6 @@ function handlePacket(msg) {
     const playerIndex = msg.readUInt8(22);
     if (playerIndex > 21) return;
 
-    // Car Status packet (ID 7) — read real idle/max RPM
-    if (packetId === 7) {
-      const STATUS_CAR_SIZE = 47;
-      const statusBase = 24 + playerIndex * STATUS_CAR_SIZE;
-      const newMax = msg.readUInt16LE(statusBase + 17);
-      const newIdle = msg.readUInt16LE(statusBase + 19);
-      if (newMax > 0 && newMax < 20000) {
-        if (maxRpm !== newMax || idleRpm !== newIdle) {
-          maxRpm = newMax;
-          idleRpm = newIdle;
-          console.log(`📊 RPM range updated: idle=${idleRpm}, max=${maxRpm}`);
-        }
-      }
-      return;
-    }
-
     // Car Telemetry packet (ID 6)
     if (packetId !== 6) return;
 
@@ -212,13 +193,18 @@ function handlePacket(msg) {
     const rpm = msg.readUInt16LE(base + 16);
     if (rpm <= 0 || rpm > 20000) return;
 
+    const revLightsPercent = msg.readUInt8(base + 19);
+
     const gear = msg.readInt8(base + 15);
-    if (gear > previousGear) {
-      hasBeepedThisShift = false; // upshift — allow beep for new gear
+    if (previousGear >= 0 && gear > previousGear) {
+      hasBeepedThisShift = false;
+      beepArmed = true; // only beep after a real upshift
+    } else if (gear < previousGear) {
+      beepArmed = false; // suppress beep on downshift RPM spikes
     }
     previousGear = gear;
 
-    updateLEDs(rpm);
+    updateLEDs(rpm, revLightsPercent);
     resetWatchdog();
   } catch (err) {
     console.log("Packet error:", err.message);
