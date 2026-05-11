@@ -87,19 +87,35 @@ function writeLED(mask) {
   device.write([0xf8, 0x12, mask, 0x00, 0x00, 0x00, 0x01]);
 }
 
-// ===== STARTUP RESET (ADDED) =====
-function resetLEDsOnStartup() {
+// ===== STARTUP ANIMATION =====
+function playStartupAnimation() {
   if (!device) return;
 
-  // small delay ensures HID is ready
+  const leds = [0x01, 0x02, 0x04, 0x08, 0x10];
+  const delay = 80; // ms between steps
+  let step = 0;
+  let mask = 0x00;
+
   setTimeout(() => {
-    writeLED(0x00);
-    writeLED(0x00);
-
-    previousMask = -1;
-
-    console.log("🔄 Startup LED reset complete");
-  }, 300);
+    const timer = setInterval(() => {
+      if (step < leds.length) {
+        // sweep on: left to right
+        mask |= leds[step];
+        writeLED(mask);
+      } else if (step < leds.length * 2) {
+        // sweep off: left to right
+        mask &= ~leds[step - leds.length];
+        writeLED(mask);
+      } else {
+        // done
+        clearInterval(timer);
+        writeLED(0x00);
+        previousMask = -1;
+        console.log("🔄 Startup animation complete");
+      }
+      step++;
+    }, delay);
+  }, 300); // small delay ensures HID is ready
 }
 
 // ===== CLEANUP =====
@@ -214,8 +230,7 @@ function handlePacket(msg) {
 // ===== START =====
 connectWheel();
 
-// 🔥 ADDED: safe startup reset (does NOT interfere with your working logic)
-resetLEDsOnStartup();
+playStartupAnimation();
 
 const socket = dgram.createSocket("udp4");
 
